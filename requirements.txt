@@ -1,4 +1,6 @@
-requests
 playwright
+playwright-stealth
 colorama
-python-dotenv
+requests
+opencv-python
+ultralytics
