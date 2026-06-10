@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-arb_scanner.py v4.0
-Scraping REAL de Betwarrior + Bookmaker.eu
-Compara cuotas del mismo partido entre las dos casas
-Alerta con exactamente donde apostar y cuanto
+arb_scanner.py v4.1
+Betwarrior (Kambi) + Bookmaker.eu -- selectores REALES basados en debug
 """
 import asyncio, json, os, re, time
 from datetime import datetime
@@ -16,26 +14,18 @@ try:
 except ImportError:
     pass
 
-try:
-    from playwright.async_api import async_playwright
-    PW_OK = True
-except ImportError:
-    PW_OK = False
-    print("[ERROR] Playwright no instalado.")
-    print("        Correr: pip install playwright && python -m playwright install chromium")
-    exit(1)
+from playwright.async_api import async_playwright
 
-# CONFIG
 BANKROLL      = float(os.getenv("BANKROLL", "10000"))
 MIN_MARGEN    = float(os.getenv("MIN_MARGEN", "0.5"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 ALERT_LOG     = Path("surebets_encontrados.json")
-UAGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+SIM_THRESHOLD = 0.55
 
-# Similitud minima para considerar que dos nombres son el mismo partido
-SIM_THRESHOLD = 0.60
+# Chrome 126 UA para pasar el bloqueo de Bookmaker
+UA_126 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-# ── MATEMATICA ────────────────────────────────────────────────────────────────
+# ── MATEMATICA ──────────────────────────────────────────────────────
 def calcular_arb(odd1, odd2, bankroll=None):
     if bankroll is None: bankroll = BANKROLL
     ti = 1/odd1 + 1/odd2
@@ -52,100 +42,161 @@ def similitud(a, b):
     b = re.sub(r'[^a-z0-9 ]', '', b.lower())
     return SequenceMatcher(None, a, b).ratio()
 
-# ── SCRAPER BETWARRIOR ────────────────────────────────────────────────────────
+# ── SCRAPER BETWARRIOR (Kambi) ───────────────────────────────────────
 async def scrape_bw(page):
-    """Scrapea Betwarrior y devuelve lista de partidos con cuotas."""
     partidos = []
     try:
         print("  [BW] Cargando...", end=" ", flush=True)
         await page.goto(
             "https://mza.betwarrior.bet.ar/es-ar/sports/home",
-            wait_until="networkidle", timeout=45000
+            wait_until="networkidle", timeout=50000
         )
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(4000)
 
-        # Intentar hacer scroll para cargar mas partidos
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-        await page.wait_for_timeout(2000)
+        # Esperar que aparezcan outcomes de Kambi
+        try:
+            await page.wait_for_selector(".KambiBC-betty-outcome", timeout=10000)
+        except:
+            print("  [BW] Selector Kambi no aparecio todavia, leyendo igual...")
 
         resultado = await page.evaluate("""
           () => {
             const partidos = [];
-            // Buscar todos los textos que parezcan cuotas
-            const allText = document.body.innerText;
-            const lines = allText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
 
-            // Encontrar bloques: nombre de partido + cuotas
-            for (let i = 0; i < lines.length - 3; i++) {
-              const l = lines[i];
-              // Una linea de partido suele tener 'vs', '-', o dos palabras con mayuscula
-              const esPartido = l.includes(' vs ') || l.includes(' - ') ||
-                                (l.length > 5 && l.length < 80 && /[A-Z]/.test(l));
+            // Cada evento Kambi tiene contenedor con clase bet-offer
+            const eventos = document.querySelectorAll(
+              '[class*="KambiBC-event-item"], [class*="KambiBC-bet-offer"]'
+            );
 
-              if (!esPartido) continue;
+            eventos.forEach(ev => {
+              // Nombre del partido: buscar el elemento de participantes
+              const nameEl = ev.querySelector(
+                '[class*="KambiBC-event-participants"], [class*="participant"], [class*="team-name"], [class*="event-name"]'
+              );
+              const nombre = nameEl ? nameEl.innerText.trim().replace(/\\n+/g,' ') : '';
 
-              // Buscar cuotas en las proximas 8 lineas
+              // Cuotas: elementos outcome tienen la cuota en texto
+              const outcomeEls = ev.querySelectorAll('[class*="KambiBC-betty-outcome"]');
               const cuotas = [];
-              for (let j = i+1; j < Math.min(i+9, lines.length); j++) {
-                const v = parseFloat(lines[j].replace(',','.'));
-                if (!isNaN(v) && v >= 1.10 && v <= 30.0 &&
-                    lines[j].match(/^\\d+[,.]\\d{1,3}$/)) {
-                  cuotas.push(v);
-                }
-              }
+              outcomeEls.forEach(oc => {
+                // La cuota esta en el span interno con el numero
+                const spans = oc.querySelectorAll('span, div');
+                spans.forEach(s => {
+                  const v = parseFloat(s.innerText.trim().replace(',','.'));
+                  if (!isNaN(v) && v >= 1.05 && v <= 50.0 && s.innerText.trim().match(/^\\d+\\.\\d+$/)) {
+                    cuotas.push(v);
+                  }
+                });
+              });
 
-              if (cuotas.length >= 2) {
-                partidos.push({ nombre: l.slice(0, 70), cuotas: [...new Set(cuotas)].slice(0,3) });
-                i += 3; // saltar las cuotas ya procesadas
+              if (nombre.length > 3 && cuotas.length >= 2) {
+                partidos.push({ nombre: nombre.slice(0,70), cuotas: [...new Set(cuotas)].slice(0,4) });
+              }
+            });
+
+            // Fallback: si no encontro nada con el primer metodo,
+            // agarrar todos los KambiBC-betty-outcome en grupos de 2-3
+            if (partidos.length === 0) {
+              const allOutcomes = [...document.querySelectorAll('[class*="KambiBC-betty-outcome"]')];
+              const allOdds = [];
+              allOutcomes.forEach(oc => {
+                const txt = oc.innerText.trim();
+                const lines = txt.split('\\n').map(l => l.trim()).filter(Boolean);
+                lines.forEach(l => {
+                  const v = parseFloat(l.replace(',','.'));
+                  if (!isNaN(v) && v >= 1.05 && v <= 50.0) allOdds.push(v);
+                });
+              });
+              // Agrupar en pares/trios (H2H tiene 2 o 3 cuotas)
+              for (let i = 0; i + 1 < allOdds.length; i += 2) {
+                const cuotas = allOdds.slice(i, i+3);
+                if (cuotas.length >= 2)
+                  partidos.push({ nombre: `Partido_${i/2}`, cuotas });
               }
             }
+
             return partidos;
           }
         """)
 
         partidos = resultado
-        print(f"OK ({len(partidos)} partidos)")
+        print(f"OK ({len(partidos)} partidos, {sum(len(p['cuotas']) for p in partidos)} cuotas)")
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
 
-# ── SCRAPER BOOKMAKER.EU ──────────────────────────────────────────────────────
+# ── SCRAPER BOOKMAKER.EU ─────────────────────────────────────────────
 async def scrape_bookmaker(page):
-    """Scrapea Bookmaker.eu y devuelve lista de partidos con cuotas."""
     partidos = []
     try:
         print("  [BK] Cargando...", end=" ", flush=True)
         await page.goto(
-            "https://be.bookmaker.eu/sports",
-            wait_until="networkidle", timeout=45000
+            "https://www.bookmaker.eu/sports-betting/odds",
+            wait_until="networkidle", timeout=50000
         )
-        await page.wait_for_timeout(5000)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(4000)
+
+        # Hacer clic en "Continuar de todos modos" si aparece el warning de Chrome
+        try:
+            btn = page.locator("text=Continuar de todos modos")
+            if await btn.count() > 0:
+                await btn.first.click()
+                print("[bypass Chrome warning]", end=" ", flush=True)
+                await page.wait_for_timeout(3000)
+        except:
+            pass
+
+        # Tambien intentar la URL de odds directa
+        html = await page.content()
+        if len(html) < 30000:
+            # Pagina muy chica = probablemente solo el warning, reintentar
+            await page.goto(
+                "https://www.bookmaker.eu/sports-betting/football",
+                wait_until="networkidle", timeout=40000
+            )
+            await page.wait_for_timeout(4000)
+            try:
+                btn = page.locator("text=Continuar de todos modos, text=Continue Anyway")
+                if await btn.count() > 0:
+                    await btn.first.click()
+                    await page.wait_for_timeout(3000)
+            except:
+                pass
 
         resultado = await page.evaluate("""
           () => {
             const partidos = [];
-            const allText = document.body.innerText;
-            const lines = allText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+            const txt = document.body.innerText;
+            const lines = txt.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
 
-            for (let i = 0; i < lines.length - 3; i++) {
+            // Buscar lineas con 'vs' o equipos y cuotas cerca
+            for (let i = 0; i < lines.length - 2; i++) {
               const l = lines[i];
-              const esPartido = l.includes(' vs ') || l.includes(' - ') ||
-                                (l.length > 5 && l.length < 80 && /[A-Z]/.test(l));
+              const esPartido = l.includes(' vs ') || l.includes(' VS ') ||
+                                l.includes(' v ') ||
+                                (l.length > 4 && l.length < 80);
               if (!esPartido) continue;
 
               const cuotas = [];
-              for (let j = i+1; j < Math.min(i+9, lines.length); j++) {
-                const v = parseFloat(lines[j].replace(',','.'));
-                if (!isNaN(v) && v >= 1.10 && v <= 30.0 &&
-                    lines[j].match(/^\\d+[,.]\\d{1,3}$/)) {
-                  cuotas.push(v);
+              for (let j = i+1; j < Math.min(i+10, lines.length); j++) {
+                const cleaned = lines[j].replace(',','.');
+                // Cuotas americanas: +150, -110
+                const am = cleaned.match(/^([+-]\\d{2,4})$/);
+                if (am) {
+                  const a = parseInt(am[1]);
+                  const dec = a > 0 ? (a/100)+1 : (100/Math.abs(a))+1;
+                  if (dec >= 1.05 && dec <= 50) cuotas.push(parseFloat(dec.toFixed(3)));
+                  continue;
+                }
+                // Cuotas decimales
+                const d = parseFloat(cleaned);
+                if (!isNaN(d) && d >= 1.05 && d <= 50.0 &&
+                    cleaned.match(/^\\d+[.,]\\d{1,4}$/)) {
+                  cuotas.push(d);
                 }
               }
-
               if (cuotas.length >= 2) {
-                partidos.push({ nombre: l.slice(0, 70), cuotas: [...new Set(cuotas)].slice(0,3) });
+                partidos.push({ nombre: l.slice(0,70), cuotas: [...new Set(cuotas)].slice(0,4) });
                 i += 3;
               }
             }
@@ -154,24 +205,25 @@ async def scrape_bookmaker(page):
         """)
 
         partidos = resultado
-        print(f"OK ({len(partidos)} partidos)")
+        html_len = len(await page.content())
+        print(f"OK ({len(partidos)} partidos, html: {html_len:,} chars)")
+
+        if len(partidos) == 0 and html_len < 50000:
+            print("  [BK] AVISO: HTML muy chico, el sitio puede requerir login o IP bloqueada")
+
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
 
-# ── COMPARAR PARTIDOS ENTRE CASAS ────────────────────────────────────────────
+# ── CRUZAR Y BUSCAR ARBITRAJE ────────────────────────────────────────
 def cruzar_y_buscar_arb(partidos_bw, partidos_bk):
-    """Cruza partidos de BW y BK por similitud de nombre y busca surebets."""
     surebets = []
-
+    matches = 0
     for pbw in partidos_bw:
         for pbk in partidos_bk:
             sim = similitud(pbw["nombre"], pbk["nombre"])
-            if sim < SIM_THRESHOLD:
-                continue
-
-            # Mismo partido encontrado en las dos casas
-            # Comparar cada combinacion de cuotas entre casas distintas
+            if sim < SIM_THRESHOLD: continue
+            matches += 1
             for o_bw in pbw["cuotas"]:
                 for o_bk in pbk["cuotas"]:
                     res = calcular_arb(o_bw, o_bk)
@@ -180,16 +232,16 @@ def cruzar_y_buscar_arb(partidos_bw, partidos_bk):
                             "timestamp": datetime.now().isoformat(),
                             "evento":    pbw["nombre"],
                             "evento_bk": pbk["nombre"],
-                            "odd_bw":    o_bw,
-                            "odd_bk":    o_bk,
+                            "odd_bw": o_bw, "odd_bk": o_bk,
                             **res
                         }
                         surebets.append(sb)
                         alerta_surebet(sb)
-
+    if matches:
+        print(f"  {matches} partidos cruzados entre casas")
     return surebets
 
-# ── ALERTA ────────────────────────────────────────────────────────────────────
+# ── ALERTA ───────────────────────────────────────────────────────────
 def alerta_surebet(sb):
     print()
     print("=" * 66)
@@ -197,16 +249,15 @@ def alerta_surebet(sb):
     print("=" * 66)
     print(f"  Evento BW  : {sb['evento']}")
     print(f"  Evento BK  : {sb['evento_bk']}")
-    print(f"  " + "-"*62)
-    print(f"  APUESTA 1 : ${sb['s1']:>10,.2f}  cuota {sb['odd_bw']:.2f}  --> BETWARRIOR")
-    print(f"  APUESTA 2 : ${sb['s2']:>10,.2f}  cuota {sb['odd_bk']:.2f}  --> BOOKMAKER.EU")
-    print(f"  " + "-"*62)
-    print(f"  Margen    : +{sb['margen']:.2f}%")
+    print(f"  {'─'*62}")
+    print(f"  APUESTA 1 : ${sb['s1']:>10,.2f}  cuota {sb['odd_bw']:.3f}  --> BETWARRIOR")
+    print(f"  APUESTA 2 : ${sb['s2']:>10,.2f}  cuota {sb['odd_bk']:.3f}  --> BOOKMAKER.EU")
+    print(f"  {'─'*62}")
+    print(f"  Margen    : +{sb['margen']:.3f}%")
     print(f"  GANANCIA  : ${sb['ganancia']:>10,.2f}   ROI: {sb['roi']:.2f}%")
     print("=" * 66)
-    print()
 
-# ── SCAN PRINCIPAL ────────────────────────────────────────────────────────────
+# ── SCAN PRINCIPAL ───────────────────────────────────────────────────
 async def scan_once():
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{ts}] ---- INICIO DE SCAN ----")
@@ -214,28 +265,30 @@ async def scan_once():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+            args=["--no-sandbox",
+                  "--disable-blink-features=AutomationControlled",
                   "--disable-web-security"]
         )
-
-        # Paginas separadas para cada casa
-        ctx_bw = await browser.new_context(user_agent=UAGENT, locale="es-AR")
-        ctx_bk = await browser.new_context(user_agent=UAGENT, locale="es-AR")
+        ctx_bw = await browser.new_context(user_agent=UA_126, locale="es-AR",
+                                            viewport={"width":1400,"height":900})
+        ctx_bk = await browser.new_context(user_agent=UA_126, locale="es-AR",
+                                            viewport={"width":1400,"height":900})
         page_bw = await ctx_bw.new_page()
         page_bk = await ctx_bk.new_page()
 
-        # Scrapear las dos casas en paralelo
-        bw_result, bk_result = await asyncio.gather(
+        bw_r, bk_r = await asyncio.gather(
             scrape_bw(page_bw),
             scrape_bookmaker(page_bk)
         )
-
         await browser.close()
 
-    print(f"  [BW] {len(bw_result)} partidos | [BK] {len(bk_result)} partidos")
-    print(f"  Buscando matches entre casas...")
+    print(f"  [BW] {len(bw_r)} partidos | [BK] {len(bk_r)} partidos")
 
-    surebets = cruzar_y_buscar_arb(bw_result, bk_result)
+    if len(bw_r) == 0 and len(bk_r) == 0:
+        print("  [AVISO] Ambos scrapers devolvieron 0. Revisar conexion o sitios bloqueados.")
+        return []
+
+    surebets = cruzar_y_buscar_arb(bw_r, bk_r)
 
     if surebets:
         hist = []
@@ -247,35 +300,30 @@ async def scan_once():
             encoding="utf-8")
         print(f"  [GUARDADO] {len(surebets)} surebet(s) en {ALERT_LOG}")
     else:
-        print(f"  [RESULTADO] Sin surebets entre BW y BK (margen min: {MIN_MARGEN}%)")
+        print(f"  [RESULTADO] Sin surebets (margen min: {MIN_MARGEN}%)")
 
     return surebets
 
-# ── LOOP ──────────────────────────────────────────────────────────────────────
+# ── LOOP ─────────────────────────────────────────────────────────────
 async def main():
     print(f"""
 ================================================================
-  BETBOT SCANNER v4.0
-  Betwarrior vs Bookmaker.eu -- Comparacion DIRECTA
+  BETBOT SCANNER v4.1 - Betwarrior vs Bookmaker.eu
 ================================================================
   Bankroll    : ${BANKROLL:,.0f}
   Margen min  : {MIN_MARGEN:.1f}%
   Intervalo   : {SCAN_INTERVAL}s
-================================================================
-  Surebets guardados en: surebets_encontrados.json
-  Ctrl+C para detener
 ================================================================""")
-
     total = 0; scan_n = 0
     while True:
         try:
-            sb     = await scan_once()
-            total  += len(sb)
+            sb = await scan_once()
+            total += len(sb)
             scan_n += 1
             print(f"\n  Scans: {scan_n} | Surebets: {total} | Proximo en {SCAN_INTERVAL}s...")
             await asyncio.sleep(SCAN_INTERVAL)
         except KeyboardInterrupt:
-            print(f"\nDetenido. Total surebets encontrados: {total}")
+            print(f"\nDetenido. Total surebets: {total}")
             break
         except Exception as e:
             print(f"  Error: {e}")
