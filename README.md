@@ -1,48 +1,43 @@
-# 🎰 BetBot Visual v4
-
-Bot de arbitraje deportivo con login automático en DOS casas simultáneas.
+# BetBot Visual v2.0
 
 ## Casas soportadas
-- Bookmaker.eu
-- Betsson
-- Bet365
+- **Betwarrior** (Argentina) — grabador dedicado + captura API automatica
+- **Bookmaker.eu** — login auto + scraping
+- **Cualquier otra** — modo trainer (grabar & replay)
 
-## Setup en 3 pasos
+## Orden de uso
 
-### 1. Instalá dependencias
-Doble click en `INSTALAR.bat`
-
-### 2. Configurá tus credenciales
-Copiá `.env.example` como `.env` y completá:
 ```
-BOOKMAKER_USER=tu_correo@ejemplo.com
-BOOKMAKER_PASS=tu_clave
-
-BETSSON_USER=tu_correo@ejemplo.com
-BETSSON_PASS=tu_clave
+1. INSTALAR.bat           <- Solo la primera vez
+2. GRABAR_BETWARRIOR.bat  <- Navega en Betwarrior, bot graba todo
+3. CALCULAR_ARB.bat       <- Ingresa cuotas, calcula si hay arbitraje
+4. ENTRENAR.bat           <- El bot replica tus clicks automaticamente
 ```
 
-### 3. Correlo
-Doble click en `CORRER.bat`
+## Archivos
 
----
+```
+GRABAR_BETWARRIOR.py   <- Grabador Betwarrior + captura API JSON
+arb_calculator.py      <- Matematica de arbitraje 2-way y 3-way
+trainer.py             <- Grabar/replay clicks en cualquier casa
+main.py                <- Bot principal
+scanner.py             <- Scanner de cuotas
+vision.py              <- Reconocimiento visual OpenCV
+config.py              <- Configuracion y credenciales
+```
 
-## Módulo de Visión IA (vision.py)
+## Formula de arbitraje
 
-Si el HTML no tiene selectores estables, el bot usa OpenCV para:
-- Detectar campos de login visualmente (por forma y color)
-- Detectar botones por color (amarillo, verde, naranja)
-- Hacer click por coordenadas de pantalla
+```
+Implicita = 1/odd1 + 1/odd2 (+ 1/oddX)
+Si suma < 1.0  ->  HAY ARBITRAJE
+Margen (%) = (1 - suma) * 100
+Stake1 = Bankroll * (1/odd1) / suma
+Stake2 = Bankroll * (1/odd2) / suma
+Ganancia = Stake1 * odd1 - Bankroll
+```
 
-Para instalar: `pip install opencv-python ultralytics`
-
----
-
-## Flujo modo DOS casas
-1. Escaneá partidos por deporte
-2. Elegí el partido
-3. Elegí las 2 casas
-4. El bot hace login en AMBAS simultáneamente
-5. Busca el partido en AMBAS páginas
-6. Calcula las apuestas exactas para arbitraje garantizado
-7. Te muestra los montos y esperá que apostés
+## Requisitos
+- Python 3.8+
+- Windows 10/11
+- Cuenta en Betwarrior y/o Bookmaker.eu

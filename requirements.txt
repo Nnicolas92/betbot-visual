@@ -1,6 +1,3 @@
 playwright
-playwright-stealth
-colorama
-requests
+python-dotenv
 opencv-python
-ultralytics
