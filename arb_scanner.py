@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-arb_scanner.py v3.2
+arb_scanner.py v3.3
 Scanner automatico de surebets: Betwarrior + Bookmaker.eu
 """
 import asyncio, json, os, re, time
@@ -21,7 +21,6 @@ try:
 except ImportError:
     PW_OK = False
     print("[AVISO] Playwright no instalado. Solo se usara OddsAPI.")
-    print("        Correr: pip install playwright && python -m playwright install chromium")
 
 # CONFIG
 ODDS_API_KEY  = os.getenv("ODDS_API_KEY", "").strip()
@@ -30,15 +29,12 @@ MIN_MARGEN    = float(os.getenv("MIN_MARGEN", "0.5"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 ALERT_LOG     = Path("surebets_encontrados.json")
 UAGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0.0.0 Safari/537.36"
-
-# Deportes que no soportan h2h (causan 422)
 SKIP_MARKETS = ["_winner", "_championship", "_outright", "_season"]
 
-# Cache de deportes
 _sports_cache = []
 _sports_ts    = 0
 
-# ── MATEMATICA ───────────────────────────────────────────────────────────────
+# MATEMATICA
 def calcular_arb(odds: list, bankroll=None):
     if bankroll is None: bankroll = BANKROLL
     if len(odds) < 2: return None
@@ -56,7 +52,7 @@ def calcular_arb(odds: list, bankroll=None):
         "roi":      round(ganancia / bankroll * 100, 2)
     }
 
-# ── ODDS API ─────────────────────────────────────────────────────────────────
+# ODDS API
 def get_sports():
     global _sports_cache, _sports_ts
     if not ODDS_API_KEY: return []
@@ -69,7 +65,6 @@ def get_sports():
         )
         with ureq.urlopen(r, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-        # Filtrar deportes que sabemos que fallan con h2h
         activos = [
             s["key"] for s in data
             if s.get("active", False)
@@ -107,12 +102,12 @@ def fetch_odds(sport):
                 })
         return eventos
     except urllib.error.HTTPError:
-        return []  # silenciar 404/422 completamente
+        return []
     except Exception as e:
         print(f"  [API/{sport[:20]}] {e}")
         return []
 
-# ── SCRAPING BETWARRIOR ───────────────────────────────────────────────────────
+# SCRAPING BETWARRIOR
 async def scrape_betwarrior():
     if not PW_OK: return []
     eventos = []
@@ -124,8 +119,7 @@ async def scrape_betwarrior():
             )
             ctx = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
-                user_agent=UAGENT,
-                locale="es-AR"
+                user_agent=UAGENT, locale="es-AR"
             )
             page = await ctx.new_page()
             captured = []
@@ -142,18 +136,14 @@ async def scrape_betwarrior():
                     except: pass
 
             page.on("response", capturar)
-
             print("  [BW] Abriendo Betwarrior...", end=" ", flush=True)
             await page.goto(
                 "https://mza.betwarrior.bet.ar/es-ar/sports/home",
-                wait_until="domcontentloaded",
-                timeout=30000
+                wait_until="domcontentloaded", timeout=30000
             )
-            # Esperar que carguen las cuotas
             await page.wait_for_timeout(6000)
             print("listo")
 
-            # Parsear cuotas del DOM
             dom = await page.evaluate("""
                 () => {
                     const res = [];
@@ -188,7 +178,6 @@ async def scrape_betwarrior():
                         "casas":   {"betwarrior": ev["odds"]}
                     })
 
-            # Parsear JSON de red capturados
             num_re = re.compile(r'\b([1-9]\d*\.\d{1,3})\b')
             for cap in captured:
                 try:
@@ -205,29 +194,31 @@ async def scrape_betwarrior():
 
             await browser.close()
             print(f"  [BW] {len(dom)} partidos en DOM | {len(captured)} respuestas de red")
-
     except Exception as e:
         print(f"  [BW] Error: {e}")
     return eventos
 
-# ── ALERTA ────────────────────────────────────────────────────────────────────
+# ALERTA  -- FIX: usa indices de lista en vez de claves
 def alerta_surebet(sb):
+    stakes = sb.get("stakes", [sb.get("stake1", 0), sb.get("stake2", 0)])
+    s1 = stakes[0] if len(stakes) > 0 else 0
+    s2 = stakes[1] if len(stakes) > 1 else 0
     print()
     print("=" * 62)
     print("  ***  SUREBET ENCONTRADO  -  APOSTA AHORA!  ***")
     print("=" * 62)
     print(f"  Evento  : {sb['evento']}")
     print(f"  Deporte : {sb['deporte']}")
-    if sb["inicio"]: print(f"  Inicio  : {sb['inicio']}")
+    if sb.get("inicio"): print(f"  Inicio  : {sb['inicio']}")
     print(f"  Cuota 1 : {sb['odd1']}        Cuota 2 : {sb['odd2']}")
     print(f"  Margen  : +{sb['margen']:.2f}%")
-    print(f"  STAKE 1 : ${sb['stake1']:>12,.2f}")
-    print(f"  STAKE 2 : ${sb['stake2']:>12,.2f}")
+    print(f"  STAKE 1 : ${s1:>12,.2f}  <-- aposta este monto")
+    print(f"  STAKE 2 : ${s2:>12,.2f}  <-- aposta este monto")
     print(f"  GANANCIA: ${sb['ganancia']:>12,.2f}   ROI: {sb['roi']:.2f}%")
     print("=" * 62)
     print()
 
-# ── PROCESADOR DE EVENTOS ─────────────────────────────────────────────────────
+# PROCESADOR
 def buscar_surebets(eventos):
     surebets = []
     for ev in eventos:
@@ -235,8 +226,8 @@ def buscar_surebets(eventos):
         if not casas: continue
         todos = []
         for odds in casas.values():
-            if isinstance(odds, list):            todos.extend(odds)
-            elif isinstance(odds, (int,float)):   todos.append(float(odds))
+            if isinstance(odds, list):          todos.extend(odds)
+            elif isinstance(odds, (int,float)): todos.append(float(odds))
         if len(todos) < 2: continue
         for i in range(len(todos)):
             for j in range(i+1, len(todos)):
@@ -246,23 +237,24 @@ def buscar_surebets(eventos):
                         "timestamp": datetime.now().isoformat(),
                         "evento":    ev["evento"],
                         "deporte":   ev["deporte"],
-                        "inicio":    ev["inicio"],
+                        "inicio":    ev.get("inicio", ""),
                         "odd1":      todos[i],
                         "odd2":      todos[j],
-                        **res
+                        "margen":    res["margen"],
+                        "stakes":    res["stakes"],
+                        "ganancia":  res["ganancia"],
+                        "roi":       res["roi"]
                     }
                     surebets.append(sb)
                     alerta_surebet(sb)
     return surebets
 
-# ── SCAN PRINCIPAL ────────────────────────────────────────────────────────────
+# SCAN
 async def scan_once():
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{ts}] ---- INICIO DE SCAN ----")
 
     eventos = []
-
-    # OddsAPI
     if ODDS_API_KEY:
         sports = get_sports()
         print(f"  [API] Consultando {len(sports)} deportes...")
@@ -271,17 +263,14 @@ async def scan_once():
             if ev:
                 print(f"    {sport[:35]:<35} {len(ev)} eventos")
             eventos += ev
-        print(f"  [API] Total: {len(eventos)} eventos con cuotas multiples")
+        print(f"  [API] Total: {len(eventos)} eventos")
     else:
         print("  [API] Sin API key - solo Betwarrior")
 
-    # Betwarrior scraping
     bw = await scrape_betwarrior()
     eventos += bw
-
     print(f"  [TOTAL] {len(eventos)} eventos a analizar")
 
-    # Buscar surebets
     surebets = buscar_surebets(eventos)
 
     if surebets:
@@ -299,16 +288,16 @@ async def scan_once():
 
     return surebets
 
-# ── LOOP ──────────────────────────────────────────────────────────────────────
+# LOOP
 async def main():
     print("""
 ================================================================
-  BETBOT SCANNER v3.2 - Surebets Garantizados
+  BETBOT SCANNER v3.3 - Surebets Garantizados
   Betwarrior + Bookmaker.eu + 40 deportes
 ================================================================
   Bankroll    : ${:,.0f}
   Margen min  : {:.1f}%
-  Intervalo   : {}s entre scans
+  Intervalo   : {}s
   API Key     : {}
 ================================================================
   Surebets se guardan en: surebets_encontrados.json
@@ -325,13 +314,13 @@ async def main():
             sb = await scan_once()
             total  += len(sb)
             scan_n += 1
-            print(f"\n  Scans: {scan_n} | Surebets totales: {total} | Proximo scan en {SCAN_INTERVAL}s...")
+            print(f"\n  Scans: {scan_n} | Surebets totales: {total} | Proximo en {SCAN_INTERVAL}s...")
             await asyncio.sleep(SCAN_INTERVAL)
         except KeyboardInterrupt:
-            print(f"\nDetenido. Total surebets encontrados: {total}")
+            print(f"\nDetenido. Total surebets: {total}")
             break
         except Exception as e:
-            print(f"  Error inesperado: {e}")
+            print(f"  Error: {e}")
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
