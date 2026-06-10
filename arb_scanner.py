@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-arb_scanner.py v4.5
-Fix definitivo basado en screenshots reales:
-- BW: login buscando por placeholder 'Correo electronico'
-- BK: scraper lee tabla HTML con moneylines americanas
+arb_scanner.py v4.6
+Fixes basados en screenshots reales:
+- BK: login usa inputs Account/Password del HEADER (no formulario separado)
+- BK: URL correcta es bookmaker.eu/lines/ no /sports-betting/football (404)
+- BW: mayor timeout esperando modal + click ENTRAR/UNIRSE
 """
 import asyncio, json, os, re
 from datetime import datetime
@@ -35,8 +36,8 @@ def similitud(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 def americana_a_decimal(s):
-    """Convierte moneyline americana (+150, -110) a cuota decimal."""
     try:
+        s = str(s).strip()
         a = int(s)
         if a > 0: return round(a/100 + 1, 3)
         else:     return round(100/abs(a) + 1, 3)
@@ -52,73 +53,60 @@ def calcular_arb(o1, o2, bankroll=None):
     g  = round(s1 * o1 - bankroll, 2)
     return {"margen": round(m,3), "s1": s1, "s2": s2, "ganancia": g, "roi": round(g/bankroll*100,2)}
 
-async def cerrar_popups(page):
-    for sel in [
-        "button[aria-label*='close']", "button[aria-label*='Close']",
-        ".close", "[class*='close-btn']", "[class*='modal__close']",
-        "#onetrust-accept-btn-handler",
-        "text=Aceptar", "text=Entendido", "text=OK",
-    ]:
-        try:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                await loc.first.click(timeout=1200)
-                await page.wait_for_timeout(600)
-        except: pass
-
-# ── BETWARRIOR LOGIN ────────────────────────────────────────────────────
+# ── BETWARRIOR LOGIN ──────────────────────────────────────────────────────────
 async def bw_login(page):
     print("  [BW] Login...", end=" ", flush=True)
     await page.goto("https://mza.betwarrior.bet.ar/es-ar/sports/home",
-                    wait_until="networkidle", timeout=50000)
-    await page.wait_for_timeout(3000)
+                    wait_until="networkidle", timeout=60000)
+    await page.wait_for_timeout(4000)
 
-    # Click en ENTRAR/UNIRSE (boton top-right)
-    try:
-        await page.click("text=ENTRAR/UNIRSE", timeout=5000)
-        await page.wait_for_timeout(2000)
-    except:
+    # Click en ENTRAR/UNIRSE
+    clicked = False
+    for txt in ["ENTRAR/UNIRSE", "ENTRAR", "Iniciar sesión", "Login"]:
         try:
-            await page.click("text=ENTRAR", timeout=3000)
-            await page.wait_for_timeout(2000)
+            await page.click(f"text={txt}", timeout=4000)
+            clicked = True
+            await page.wait_for_timeout(3000)
+            break
         except: pass
 
-    # Esperar modal con campos -- buscar por placeholder exacto del screenshot
+    if not clicked:
+        # intentar click por selector boton top-right
+        try:
+            await page.click("a[href*='login'], button[class*='login'], .login-btn", timeout=3000)
+            await page.wait_for_timeout(3000)
+        except: pass
+
+    # Esperar campos por placeholder (del screenshot: 'Correo electrónico')
+    email_sel = "input[placeholder*='orreo'], input[placeholder*='mail'], input[placeholder*='Email']"
+    pass_sel  = "input[placeholder*='ontra'], input[placeholder*='assword'], input[type='password']"
+
     try:
-        await page.wait_for_selector(
-            "input[placeholder='Correo electr\u00f3nico'], input[placeholder='Correo electronico'], input[placeholder*='correo'], input[placeholder*='email'], input[placeholder*='Email']",
-            timeout=10000
-        )
+        await page.wait_for_selector(email_sel, timeout=12000)
     except:
         await page.screenshot(path="debug_bw_login.png")
         print("FALLO - ver debug_bw_login.png")
         return False
 
-    # Llenar email
-    await page.fill(
-        "input[placeholder='Correo electr\u00f3nico'], input[placeholder='Correo electronico'], input[placeholder*='correo'], input[placeholder*='email'], input[placeholder*='Email']",
-        BW_USER
-    )
-    await page.wait_for_timeout(400)
+    await page.fill(email_sel, BW_USER)
+    await page.wait_for_timeout(500)
+    await page.fill(pass_sel, BW_PASS)
+    await page.wait_for_timeout(500)
 
-    # Llenar contrasena
-    await page.fill("input[placeholder='Contrase\u00f1a'], input[placeholder='Contrasena'], input[type='password']", BW_PASS)
-    await page.wait_for_timeout(400)
-
-    # Click en INICIAR SESION
-    try:
-        await page.click("text=INICIAR SESI\u00d3N", timeout=4000)
-    except:
+    # Click INICIAR SESIÓN
+    for txt in ["INICIAR SESIÓN", "INICIAR SESION", "Iniciar sesión"]:
         try:
-            await page.click("text=INICIAR SESION", timeout=3000)
-        except:
-            await page.press("input[type='password']", "Enter")
+            await page.click(f"text={txt}", timeout=3000)
+            break
+        except: pass
+    else:
+        await page.press(pass_sel, "Enter")
 
-    await page.wait_for_timeout(6000)
+    await page.wait_for_timeout(7000)
     print("OK")
     return True
 
-# ── BETWARRIOR SCRAPE ────────────────────────────────────────────────────
+# ── BETWARRIOR SCRAPE ─────────────────────────────────────────────────────────
 async def scrape_bw(page):
     partidos = []
     try:
@@ -171,56 +159,63 @@ async def scrape_bw(page):
         print(f"ERROR: {e}")
     return partidos
 
-# ── BOOKMAKER LOGIN ─────────────────────────────────────────────────────
+# ── BOOKMAKER LOGIN ───────────────────────────────────────────────────────────
+# Del screenshot: login está en el HEADER con inputs Account y Password visibles
 async def bk_login(page):
     print("  [BK] Login...", end=" ", flush=True)
-    # BK del screenshot ya carga logueado directo
-    # Ir a la pagina de odds con login embebido
-    await page.goto("https://www.bookmaker.eu/sports-betting/football",
-                    wait_until="networkidle", timeout=50000)
+    await page.goto("https://www.bookmaker.eu/",
+                    wait_until="networkidle", timeout=60000)
     await page.wait_for_timeout(3000)
 
-    # Si pide login, hacerlo
-    pass_el = await page.query_selector("input[type='password']")
-    if pass_el:
-        user_f = None
-        for sel in ["input[name='username']", "input[name='email']",
-                    "input[name='account']", "input[type='text']",
-                    "input[type='email']"]:
-            user_f = await page.query_selector(sel)
-            if user_f: break
-        if user_f:
-            await user_f.fill(BK_USER)
-            await pass_el.fill(BK_PASS)
-            await pass_el.press("Enter")
-            await page.wait_for_timeout(6000)
+    # Buscar inputs del header (Account + Password)
+    acct_sel = "input[name='account'], input[placeholder='Account'], input[id*='account'], input[id*='username']"
+    pass_sel = "input[name='password'], input[placeholder='Password'], input[type='password']"
 
-    html_len = len(await page.content())
-    print(f"OK (html: {html_len:,} chars)")
-    return True
+    acct = await page.query_selector(acct_sel)
+    pwd  = await page.query_selector(pass_sel)
 
-# ── BOOKMAKER SCRAPE - tabla HTML con moneylines americanas ─────────────────
+    if acct and pwd:
+        await acct.fill(BK_USER)
+        await pwd.fill(BK_PASS)
+        # Click en el boton Login del header
+        try:
+            await page.click("input[value='Login'], button:has-text('Login'), input[type='submit']", timeout=4000)
+        except:
+            await pwd.press("Enter")
+        await page.wait_for_timeout(6000)
+        html_len = len(await page.content())
+        print(f"OK (html: {html_len:,} chars)")
+        return True
+    else:
+        await page.screenshot(path="debug_bk_login.png")
+        print("FALLO - no se encontraron campos Account/Password")
+        return False
+
+# ── BOOKMAKER SCRAPE ──────────────────────────────────────────────────────────
+# URLs correctas de bookmaker.eu con cuotas visibles (del screenshot: /lines/)
+BK_URLS = [
+    "https://www.bookmaker.eu/lines/",           # página principal de líneas
+    "https://www.bookmaker.eu/lines/soccer/",
+    "https://www.bookmaker.eu/lines/basketball/",
+    "https://www.bookmaker.eu/lines/tennis/",
+]
+
 async def scrape_bk(page):
     partidos = []
     try:
         print("  [BK] Cuotas...", end=" ", flush=True)
 
-        # Deportes a scrapear
-        urls = [
-            "https://www.bookmaker.eu/sports-betting/football",
-            "https://www.bookmaker.eu/sports-betting/basketball",
-            "https://www.bookmaker.eu/sports-betting/baseball",
-        ]
+        for url in BK_URLS:
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=35000)
+                await page.wait_for_timeout(2000)
+            except:
+                continue
 
-        for url in urls:
-            await page.goto(url, wait_until="networkidle", timeout=40000)
-            await page.wait_for_timeout(2000)
-
-            # Leer tabla HTML: filas con Team + Moneyline
+            # Leer tabla: filas con Team + Moneyline americana
             rows = await page.evaluate("""
             (function() {
               var result = [];
-              // La tabla tiene columnas: Time | Team | Spread | Total | Moneyline
               var rows = document.querySelectorAll('tr');
               var prevTeam = null;
               var prevMl   = null;
@@ -229,25 +224,29 @@ async def scrape_bk(page):
                 var cells = row.querySelectorAll('td');
                 if (cells.length < 2) return;
 
-                // Buscar celda de equipo (texto largo sin numeros solos)
                 var teamCell = null;
                 var mlCell   = null;
 
                 cells.forEach(function(td) {
                   var txt = td.innerText.trim();
-                  // Moneyline americana: +XXX o -XXX
-                  if (/^[+-][0-9]{2,4}$/.test(txt)) mlCell = txt;
-                  // Nombre de equipo: texto sin slash, longitud razonable
-                  else if (txt.length > 3 && txt.length < 50 && !/^[0-9\/:.]+$/.test(txt) && txt.indexOf('$') === -1)
+                  // Moneyline americana: +XXX o -XXX (2 a 4 digitos)
+                  if (/^[+\-][0-9]{2,4}$/.test(txt)) {
+                    mlCell = txt;
+                  }
+                  // Nombre equipo: texto razonable
+                  else if (txt.length > 3 && txt.length < 60
+                           && !/^[0-9\/:.]+$/.test(txt)
+                           && txt.indexOf('$') === -1
+                           && txt.toUpperCase() !== txt) {
                     teamCell = txt;
+                  }
                 });
 
                 if (teamCell && mlCell) {
                   if (prevTeam && prevMl) {
-                    // Par completo
                     result.push({
                       nombre: prevTeam + ' vs ' + teamCell,
-                      cuotas: [prevMl, mlCell]  // strings, se convierten despues
+                      cuotas: [prevMl, mlCell]
                     });
                     prevTeam = null; prevMl = null;
                   } else {
@@ -260,7 +259,6 @@ async def scrape_bk(page):
             })()
             """)
 
-            # Convertir moneylines a decimal
             for row in rows:
                 cuotas_dec = []
                 for ml in row["cuotas"]:
@@ -273,16 +271,16 @@ async def scrape_bk(page):
         print(f"OK ({len(partidos)} partidos, html: {html_len:,} chars)")
 
         if len(partidos) == 0:
+            await page.screenshot(path="debug_bk_live.png")
             txt = await page.evaluate("(function(){ return document.body.innerText; })()")
             Path("debug_bk_live.txt").write_text(txt[:5000], encoding="utf-8")
-            await page.screenshot(path="debug_bk_live.png")
             print("  [BK] 0 partidos - ver debug_bk_live.png")
 
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
 
-# ── CRUZAR Y ALERTAR ────────────────────────────────────────────────────────
+# ── CRUZAR Y ALERTAR ─────────────────────────────────────────────────────────
 def cruzar(bw, bk):
     surebets = []; matches = 0
     for pbw in bw:
@@ -340,7 +338,7 @@ async def main():
 
     print(f"""
 ================================================================
-  BETBOT SCANNER v4.5 - Betwarrior (Kambi) vs Bookmaker.eu
+  BETBOT SCANNER v4.6 - Betwarrior (Kambi) vs Bookmaker.eu
 ================================================================
   Bankroll  : ${BANKROLL:,.0f}  |  Margen: {MIN_MARGEN:.1f}%  |  Intervalo: {SCAN_INTERVAL}s
   BW Login  : {BW_USER}
@@ -354,10 +352,11 @@ async def main():
         )
         vp = {"width": 1400, "height": 900}
         ctx_bw = await browser.new_context(user_agent=UA, locale="es-AR", viewport=vp)
-        ctx_bk = await browser.new_context(user_agent=UA, locale="es-AR", viewport=vp)
+        ctx_bk = await browser.new_context(user_agent=UA, locale="en-US", viewport=vp)
         page_bw = await ctx_bw.new_page()
         page_bk = await ctx_bk.new_page()
 
+        print("  Iniciando sesiones...")
         await bw_login(page_bw)
         await bk_login(page_bk)
 
