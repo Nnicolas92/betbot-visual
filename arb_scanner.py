@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-arb_scanner.py v4.7
-Login con selectores EXACTOS grabados via playwright codegen:
-  BW: data-testid="login-email/password/submit-button"
-  BK: role textbox Account/Password + button Login
-      URL cuotas: be.bookmaker.eu/en/sports/ (cerrar popup "Don't show again")
+arb_scanner.py v4.8
+Unico fix: scrape_bw usaba reload(networkidle) que cuelga en Kambi.
+Ahora usa domcontentloaded + espera fija 8s.
 """
 import asyncio, json, os, re
 from datetime import datetime
@@ -52,19 +50,15 @@ def calcular_arb(o1, o2, bankroll=None):
     g  = round(s1 * o1 - bankroll, 2)
     return {"margen": round(m,3), "s1": s1, "s2": s2, "ganancia": g, "roi": round(g/bankroll*100,2)}
 
-# ── BETWARRIOR LOGIN ── selectores exactos del codegen ─────────────────────────
+# ── BETWARRIOR LOGIN ────────────────────────────────────────────────────
 async def bw_login(page):
     print("  [BW] Login...", end=" ", flush=True)
     try:
         await page.goto("https://mza.betwarrior.bet.ar/es-ar/sports/home",
                         wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(3000)
-
-        # Click Entrar/Unirse (texto exacto grabado)
         await page.get_by_text("Entrar/Unirse").click()
         await page.wait_for_timeout(2500)
-
-        # Campos por data-testid (exacto del codegen)
         await page.get_by_test_id("login-email").fill(BW_USER)
         await page.wait_for_timeout(400)
         await page.get_by_test_id("login-password").fill(BW_PASS)
@@ -78,16 +72,19 @@ async def bw_login(page):
         print(f"FALLO ({e}) - ver debug_bw_login.png")
         return False
 
-# ── BETWARRIOR SCRAPE ────────────────────────────────────────────────────────────
+# ── BETWARRIOR SCRAPE ── FIX: domcontentloaded en vez de networkidle ──────────
 async def scrape_bw(page):
     partidos = []
     try:
         print("  [BW] Cuotas...", end=" ", flush=True)
-        await page.reload(wait_until="networkidle", timeout=40000)
-        await page.wait_for_timeout(3000)
+
+        # FIX CLAVE: Kambi nunca dispara networkidle -> cuelga para siempre
+        # Usar domcontentloaded + espera fija para que carguen las cuotas JS
         try:
-            await page.wait_for_selector("[class*='KambiBC-betty-outcome']", timeout=10000)
-        except: pass
+            await page.reload(wait_until="domcontentloaded", timeout=20000)
+        except:
+            pass
+        await page.wait_for_timeout(8000)  # esperar que Kambi cargue cuotas via JS
 
         partidos = await page.evaluate("""
         (function() {
@@ -131,28 +128,22 @@ async def scrape_bw(page):
         print(f"ERROR: {e}")
     return partidos
 
-# ── BOOKMAKER LOGIN ── selectores exactos del codegen ──────────────────────────
+# ── BOOKMAKER LOGIN ────────────────────────────────────────────────────
 async def bk_login(page):
     print("  [BK] Login...", end=" ", flush=True)
     try:
         await page.goto("https://www.bookmaker.eu/",
                         wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(3000)
-
-        # Campos del header: role=textbox name=Account/Password (exacto codegen)
         await page.get_by_role("textbox", name="Account").fill(BK_USER)
         await page.wait_for_timeout(300)
         await page.get_by_role("textbox", name="Password").fill(BK_PASS)
         await page.wait_for_timeout(300)
         await page.get_by_role("button", name="Login").click()
         await page.wait_for_timeout(6000)
-
-        # Ir a cuotas deportivas (URL del codegen: be.bookmaker.eu/en/sports/)
         await page.goto("https://be.bookmaker.eu/en/sports/",
                         wait_until="networkidle", timeout=40000)
         await page.wait_for_timeout(3000)
-
-        # Cerrar popup "Don't show again" (grabado en codegen)
         try:
             cb = page.get_by_role("checkbox", name="Don't show again")
             if await cb.count() > 0:
@@ -162,7 +153,6 @@ async def bk_login(page):
                 await ok.click()
             await page.wait_for_timeout(1500)
         except: pass
-
         html_len = len(await page.content())
         print(f"OK (html: {html_len:,} chars)")
         return True
@@ -171,7 +161,7 @@ async def bk_login(page):
         print(f"FALLO ({e}) - ver debug_bk_login.png")
         return False
 
-# ── BOOKMAKER SCRAPE ─────────────────────────────────────────────────────────────
+# ── BOOKMAKER SCRAPE ────────────────────────────────────────────────────
 BK_SPORTS = [
     "https://be.bookmaker.eu/en/sports/",
     "https://be.bookmaker.eu/en/sports/soccer/",
@@ -183,34 +173,28 @@ async def scrape_bk(page):
     partidos = []
     try:
         print("  [BK] Cuotas...", end=" ", flush=True)
-
         for url in BK_SPORTS:
             try:
                 await page.goto(url, wait_until="networkidle", timeout=35000)
                 await page.wait_for_timeout(2000)
             except:
                 continue
-
-            # Cerrar popups si aparecen
             for txt in ["Don't show again", "Ok", "Accept", "Close"]:
                 try:
                     el = page.get_by_text(txt, exact=True)
                     if await el.count() > 0:
                         await el.first.click()
-                        await page.wait_for_timeout(800)
+                        await page.wait_for_timeout(600)
                 except: pass
-
             rows = await page.evaluate("""
             (function() {
               var result = [];
               var rows = document.querySelectorAll('tr');
-              var prevTeam = null;
-              var prevMl   = null;
+              var prevTeam = null, prevMl = null;
               rows.forEach(function(row) {
                 var cells = row.querySelectorAll('td');
                 if (cells.length < 2) return;
-                var teamCell = null;
-                var mlCell   = null;
+                var teamCell = null, mlCell = null;
                 cells.forEach(function(td) {
                   var txt = td.innerText.trim();
                   if (/^[+\-][0-9]{2,4}$/.test(txt)) {
@@ -225,16 +209,12 @@ async def scrape_bk(page):
                   if (prevTeam && prevMl) {
                     result.push({ nombre: prevTeam + ' vs ' + teamCell, cuotas: [prevMl, mlCell] });
                     prevTeam = null; prevMl = null;
-                  } else {
-                    prevTeam = teamCell;
-                    prevMl   = mlCell;
-                  }
+                  } else { prevTeam = teamCell; prevMl = mlCell; }
                 }
               });
               return result;
             })()
             """)
-
             for row in rows:
                 cuotas_dec = [americana_a_decimal(ml) for ml in row["cuotas"]]
                 cuotas_dec = [c for c in cuotas_dec if c]
@@ -243,13 +223,11 @@ async def scrape_bk(page):
 
         html_len = len(await page.content())
         print(f"OK ({len(partidos)} partidos, html: {html_len:,} chars)")
-
         if len(partidos) == 0:
             await page.screenshot(path="debug_bk_live.png")
             txt = await page.evaluate("(function(){ return document.body.innerText; })()")
             Path("debug_bk_live.txt").write_text(txt[:5000], encoding="utf-8")
             print("  [BK] 0 partidos - ver debug_bk_live.png")
-
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
@@ -309,16 +287,14 @@ async def main():
     if not BK_USER or not BK_PASS or not BW_USER or not BW_PASS:
         print("[ERROR] Faltan credenciales en .env")
         return
-
     print(f"""
 ================================================================
-  BETBOT SCANNER v4.7 - Betwarrior (Kambi) vs Bookmaker.eu
+  BETBOT SCANNER v4.8 - Betwarrior (Kambi) vs Bookmaker.eu
 ================================================================
   Bankroll  : ${BANKROLL:,.0f}  |  Margen: {MIN_MARGEN:.1f}%  |  Intervalo: {SCAN_INTERVAL}s
   BW Login  : {BW_USER}
   BK Login  : {BK_USER}
 ================================================================""")
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -329,11 +305,9 @@ async def main():
         ctx_bk = await browser.new_context(user_agent=UA, locale="en-US", viewport=vp)
         page_bw = await ctx_bw.new_page()
         page_bk = await ctx_bk.new_page()
-
         print("  Iniciando sesiones...")
         await bw_login(page_bw)
         await bk_login(page_bk)
-
         print("  Sesiones listas. Escaneando...")
         total = 0; scan_n = 0
         while True:
@@ -349,7 +323,6 @@ async def main():
             except Exception as e:
                 print(f"  Error: {e}")
                 await asyncio.sleep(15)
-
         await browser.close()
 
 if __name__ == "__main__":
