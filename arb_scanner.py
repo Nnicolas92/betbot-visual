@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-arb_scanner.py v4.3
-Login REAL en Betwarrior (Kambi) + Bookmaker.eu
-Credenciales desde .env: BETWARRIOR_USER/PASS y BOOKMAKER_USER/PASS
+arb_scanner.py v4.4
+- Fix regex rota en JS evaluate
+- Login BW maneja popups/modales emergentes
+- Login BK robusto con screenshot de debug si falla
 """
 import asyncio, json, os, re
 from datetime import datetime
@@ -28,282 +29,314 @@ ALERT_LOG     = Path("surebets_encontrados.json")
 SIM_THRESHOLD = 0.55
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-# Estado de sesion (se logueamos una vez, no en cada scan)
-_bw_logged  = False
-_bk_logged  = False
-_bw_browser = None
-_bk_browser = None
-_bw_page    = None
-_bk_page    = None
+def similitud(a, b):
+    a = re.sub(r'[^a-z0-9 ]', '', a.lower())
+    b = re.sub(r'[^a-z0-9 ]', '', b.lower())
+    return SequenceMatcher(None, a, b).ratio()
 
-# ── MATEMATICA ───────────────────────────────────────────────
 def calcular_arb(o1, o2, bankroll=None):
     if bankroll is None: bankroll = BANKROLL
     ti = 1/o1 + 1/o2
     if ti >= 1.0: return None
-    m = (1 - ti) * 100
+    m  = (1 - ti) * 100
     s1 = round(bankroll * (1/o1) / ti, 2)
     s2 = round(bankroll * (1/o2) / ti, 2)
     g  = round(s1 * o1 - bankroll, 2)
     return {"margen": round(m,3), "s1": s1, "s2": s2, "ganancia": g, "roi": round(g/bankroll*100,2)}
 
-def similitud(a, b):
-    a = re.sub(r'[^a-z0-9 ]','', a.lower())
-    b = re.sub(r'[^a-z0-9 ]','', b.lower())
-    return SequenceMatcher(None, a, b).ratio()
+# ── helper: cerrar cualquier popup/overlay emergente ─────────────────────────
+async def cerrar_popups(page):
+    """Intenta cerrar overlays, cookies, chats, modales que bloquean el form."""
+    dismissers = [
+        "button[aria-label*='close']", "button[aria-label*='Close']",
+        "button[aria-label*='cerrar']", "button[aria-label*='Cerrar']",
+        ".modal__close", ".popup__close", ".close-btn",
+        "[class*='close']", "[class*='dismiss']",
+        "text=Cerrar", "text=Aceptar", "text=Entendido",
+        "text=Acepto", "text=OK", "text=No gracias",
+        # cookie banners comunes
+        "#onetrust-accept-btn-handler",
+        "[id*='cookie'] button", "[class*='cookie'] button",
+    ]
+    for sel in dismissers:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=1500)
+                await page.wait_for_timeout(800)
+        except:
+            pass
 
-# ── BETWARRIOR: LOGIN ────────────────────────────────────────────
+# ── BETWARRIOR LOGIN ──────────────────────────────────────────────────────────
 async def bw_login(page):
-    global _bw_logged
-    print("  [BW] Haciendo login...", end=" ", flush=True)
+    print("  [BW] Login...", end=" ", flush=True)
     await page.goto("https://mza.betwarrior.bet.ar/es-ar/sports/home",
                     wait_until="networkidle", timeout=50000)
     await page.wait_for_timeout(3000)
+    await cerrar_popups(page)
 
-    # Buscar y clickear boton ENTRAR
-    try:
-        entrar = page.locator("text=ENTRAR, text=Entrar, text=Iniciar sesion, text=Login")
-        if await entrar.count() > 0:
-            await entrar.first.click()
-            await page.wait_for_timeout(2000)
-    except: pass
+    # Hacer click en ENTRAR / UNIRSE / LOGIN
+    for txt in ["ENTRAR", "Entrar", "UNIRSE", "Iniciar sesión", "LOGIN", "Login"]:
+        try:
+            btn = page.locator(f"text={txt}")
+            if await btn.count() > 0:
+                await btn.first.click()
+                await page.wait_for_timeout(2000)
+                break
+        except: pass
 
-    # Esperar campo de usuario
+    # Esperar que aparezca el campo de password (modal/popup)
     try:
-        await page.wait_for_selector("input[type='text'], input[name*='user'], input[name*='email']",
-                                      timeout=8000)
+        await page.wait_for_selector("input[type='password']", timeout=10000)
     except:
-        print("ADVERTENCIA: formulario no encontrado")
-        return
+        # Tomar screenshot para debug
+        await page.screenshot(path="debug_bw_login.png")
+        print("FALLO - ver debug_bw_login.png")
+        return False
 
-    # Llenar usuario y contraseña
-    try:
-        user_f = await page.query_selector("input[type='text'], input[name*='user'], input[name*='email']")
-        pass_f = await page.query_selector("input[type='password']")
-        if user_f and pass_f:
-            await user_f.fill(BW_USER)
-            await pass_f.fill(BW_PASS)
-            await pass_f.press("Enter")
-            await page.wait_for_timeout(5000)
-            print("OK")
-            _bw_logged = True
-        else:
-            print("campos no encontrados")
-    except Exception as e:
-        print(f"ERROR: {e}")
+    await cerrar_popups(page)  # por si hay otro popup encima
 
-# ── BETWARRIOR: SCRAPE (usa sesion activa) ──────────────────────────
+    # Llenar usuario
+    user_f = None
+    for sel in ["input[type='email']", "input[type='text']",
+                "input[name*='user']", "input[name*='email']",
+                "input[placeholder*='usuario']", "input[placeholder*='email']",
+                "input[placeholder*='correo']"]:
+        user_f = await page.query_selector(sel)
+        if user_f: break
+
+    pass_f = await page.query_selector("input[type='password']")
+
+    if not user_f or not pass_f:
+        await page.screenshot(path="debug_bw_login.png")
+        print("CAMPOS NO ENCONTRADOS - ver debug_bw_login.png")
+        return False
+
+    await user_f.click()
+    await page.wait_for_timeout(300)
+    await user_f.fill(BW_USER)
+    await pass_f.click()
+    await page.wait_for_timeout(300)
+    await pass_f.fill(BW_PASS)
+
+    submit = None
+    for sel in ["button[type='submit']", "input[type='submit']",
+                "button:has-text('Entrar')", "button:has-text('ENTRAR')",
+                "button:has-text('Iniciar')", "button:has-text('Login')"]:
+        submit = await page.query_selector(sel)
+        if submit: break
+
+    if submit:
+        await submit.click()
+    else:
+        await pass_f.press("Enter")
+
+    await page.wait_for_timeout(6000)
+    await cerrar_popups(page)
+    print("OK")
+    return True
+
+# ── BETWARRIOR SCRAPE ─────────────────────────────────────────────────────────
+KAMBI_ODDS_JS = """
+() => {
+  const partidos = [];
+  const eventos = document.querySelectorAll(
+    '[class*="KambiBC-event-item"],[class*="KambiBC-bet-offer"]'
+  );
+  eventos.forEach(ev => {
+    const nameEl = ev.querySelector(
+      '[class*="KambiBC-event-participants"],[class*="participant"],[class*="team-name"],[class*="event-name"]'
+    );
+    const nombre = nameEl ? nameEl.innerText.trim().replace(/\\n+/g,' ') : '';
+    const cuotas = [];
+    ev.querySelectorAll('[class*="KambiBC-betty-outcome"]').forEach(oc => {
+      oc.querySelectorAll('span,div').forEach(s => {
+        const txt = s.innerText.trim();
+        const v = parseFloat(txt);
+        if (!isNaN(v) && v >= 1.05 && v <= 50 && txt.indexOf('.') !== -1 && !txt.includes(' '))
+          cuotas.push(v);
+      });
+    });
+    if (nombre.length > 3 && cuotas.length >= 2)
+      partidos.push({nombre: nombre.slice(0,70), cuotas: Array.from(new Set(cuotas)).slice(0,4)});
+  });
+  if (partidos.length === 0) {
+    const allOdds = [];
+    document.querySelectorAll('[class*="KambiBC-betty-outcome"]').forEach(oc => {
+      oc.querySelectorAll('span,div').forEach(s => {
+        const txt = s.innerText.trim();
+        const v = parseFloat(txt);
+        if (!isNaN(v) && v >= 1.05 && v <= 50 && txt.indexOf('.') !== -1 && !txt.includes(' '))
+          allOdds.push(v);
+      });
+    });
+    for (let i = 0; i+1 < allOdds.length; i += 2)
+      partidos.push({nombre: 'Partido_BW_' + Math.floor(i/2), cuotas: allOdds.slice(i, i+3)});
+  }
+  return partidos;
+}
+"""
+
 async def scrape_bw(page):
     partidos = []
     try:
-        print("  [BW] Leyendo cuotas...", end=" ", flush=True)
-        # Recargar para tener cuotas frescas
+        print("  [BW] Cuotas...", end=" ", flush=True)
         await page.reload(wait_until="networkidle", timeout=40000)
         await page.wait_for_timeout(3000)
+        await cerrar_popups(page)
         try:
             await page.wait_for_selector("[class*='KambiBC-betty-outcome']", timeout=10000)
         except: pass
-
-        resultado = await page.evaluate("""
-          () => {
-            const partidos = [];
-            // Metodo 1: por contenedores de eventos
-            const eventos = document.querySelectorAll(
-              '[class*="KambiBC-event-item"],[class*="KambiBC-bet-offer"]'
-            );
-            eventos.forEach(ev => {
-              const nameEl = ev.querySelector(
-                '[class*="KambiBC-event-participants"],[class*="participant"],[class*="team-name"],[class*="event-name"]'
-              );
-              const nombre = nameEl ? nameEl.innerText.trim().replace(/\n+/g,' ') : '';
-              const cuotas = [];
-              ev.querySelectorAll('[class*="KambiBC-betty-outcome"]').forEach(oc => {
-                oc.querySelectorAll('span,div').forEach(s => {
-                  const txt = s.innerText.trim();
-                  if (/^\d+\.\d+$/.test(txt)) {
-                    const v = parseFloat(txt);
-                    if (v >= 1.05 && v <= 50) cuotas.push(v);
-                  }
-                });
-              });
-              if (nombre.length > 3 && cuotas.length >= 2)
-                partidos.push({nombre: nombre.slice(0,70), cuotas: [...new Set(cuotas)].slice(0,4)});
-            });
-            // Metodo 2 (fallback): agrupar todos los outcomes de Kambi en pares
-            if (partidos.length === 0) {
-              const allOdds = [];
-              document.querySelectorAll('[class*="KambiBC-betty-outcome"]').forEach(oc => {
-                oc.querySelectorAll('span,div').forEach(s => {
-                  const txt = s.innerText.trim();
-                  if (/^\d+\.\d+$/.test(txt)) {
-                    const v = parseFloat(txt);
-                    if (v >= 1.05 && v <= 50) allOdds.push(v);
-                  }
-                });
-              });
-              for (let i = 0; i+1 < allOdds.length; i += 2)
-                partidos.push({nombre: `Partido_BW_${Math.floor(i/2)}`, cuotas: allOdds.slice(i, i+3)});
-            }
-            return partidos;
-          }
-        """)
-        partidos = resultado
+        partidos = await page.evaluate(KAMBI_ODDS_JS)
         print(f"OK ({len(partidos)} partidos)")
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
 
-# ── BOOKMAKER: LOGIN ───────────────────────────────────────────────
+# ── BOOKMAKER LOGIN ───────────────────────────────────────────────────────────
 async def bk_login(page):
-    global _bk_logged
-    print("  [BK] Haciendo login...", end=" ", flush=True)
-
-    # Ir a la pagina principal
+    print("  [BK] Login...", end=" ", flush=True)
     await page.goto("https://www.bookmaker.eu",
                     wait_until="networkidle", timeout=50000)
     await page.wait_for_timeout(3000)
+    await cerrar_popups(page)
 
-    # Bypass warning de version de Chrome si aparece
-    try:
-        bypass = page.locator("text=Continuar de todos modos")
-        if await bypass.count() > 0:
-            await bypass.first.click()
-            await page.wait_for_timeout(2000)
-    except: pass
+    # Click en Login
+    for txt in ["Login to Account", "Login", "Entrar", "Sign In", "Ingresar"]:
+        try:
+            btn = page.locator(f"text={txt}")
+            if await btn.count() > 0:
+                await btn.first.click()
+                await page.wait_for_timeout(2000)
+                break
+        except: pass
 
-    # Hacer clic en Login/Entrar
+    # Esperar password field
     try:
-        login_btn = page.locator("text=Login to Account, text=Login, text=Entrar, text=Sign In")
-        if await login_btn.count() > 0:
-            await login_btn.first.click()
-            await page.wait_for_timeout(2000)
-    except: pass
-
-    # Esperar formulario
-    try:
-        await page.wait_for_selector("input[type='password']", timeout=8000)
+        await page.wait_for_selector("input[type='password']", timeout=10000)
     except:
-        # Intentar ir directo a /login
+        # Intentar URL directa de login
         await page.goto("https://www.bookmaker.eu/login",
                         wait_until="networkidle", timeout=40000)
         await page.wait_for_timeout(3000)
+        await cerrar_popups(page)
         try:
-            bypass = page.locator("text=Continuar de todos modos")
-            if await bypass.count() > 0:
-                await bypass.first.click()
-                await page.wait_for_timeout(2000)
-        except: pass
+            await page.wait_for_selector("input[type='password']", timeout=8000)
+        except:
+            await page.screenshot(path="debug_bk_login.png")
+            print("FALLO - ver debug_bk_login.png")
+            return False
 
-    # Llenar formulario
-    try:
-        # Campos de usuario (probar varios selectores)
-        user_f = None
-        for sel in ["input[name='username']", "input[name='email']",
-                    "input[name='account']", "input[type='text']",
-                    "input[placeholder*='user']", "input[placeholder*='account']",
-                    "input[placeholder*='email']"]:
-            user_f = await page.query_selector(sel)
-            if user_f: break
+    await cerrar_popups(page)
 
-        pass_f = await page.query_selector("input[type='password']")
+    user_f = None
+    for sel in ["input[name='username']", "input[name='email']",
+                "input[name='account']", "input[type='email']",
+                "input[type='text']", "input[placeholder*='user']",
+                "input[placeholder*='account']", "input[placeholder*='email']"]:
+        user_f = await page.query_selector(sel)
+        if user_f: break
 
-        if user_f and pass_f:
-            await user_f.click()
-            await user_f.fill(BK_USER)
-            await pass_f.click()
-            await pass_f.fill(BK_PASS)
+    pass_f = await page.query_selector("input[type='password']")
 
-            # Submit: buscar boton o presionar Enter
-            submit = await page.query_selector(
-                "button[type='submit'], input[type='submit'], "
-                "button:has-text('Login'), button:has-text('Sign In'), "
-                "button:has-text('Entrar'), button:has-text('Ingresar')"
-            )
-            if submit:
-                await submit.click()
-            else:
-                await pass_f.press("Enter")
+    if not user_f or not pass_f:
+        await page.screenshot(path="debug_bk_login.png")
+        print("CAMPOS NO ENCONTRADOS - ver debug_bk_login.png")
+        return False
 
-            await page.wait_for_timeout(6000)
-            print("OK")
-            _bk_logged = True
-        else:
-            print("FORMULARIO NO ENCONTRADO - guardando debug...")
-            html = await page.content()
-            Path("debug_bk_login.html").write_text(html[:50000], encoding="utf-8")
-            print("  Revisa debug_bk_login.html")
-    except Exception as e:
-        print(f"ERROR: {e}")
+    await user_f.click()
+    await page.wait_for_timeout(300)
+    await user_f.fill(BK_USER)
+    await pass_f.click()
+    await page.wait_for_timeout(300)
+    await pass_f.fill(BK_PASS)
 
-# ── BOOKMAKER: SCRAPE (usa sesion activa) ──────────────────────────
+    submit = None
+    for sel in ["button[type='submit']", "input[type='submit']",
+                "button:has-text('Login')", "button:has-text('Sign In')",
+                "button:has-text('Entrar')", "button:has-text('Ingresar')"]:
+        submit = await page.query_selector(sel)
+        if submit: break
+
+    if submit:
+        await submit.click()
+    else:
+        await pass_f.press("Enter")
+
+    await page.wait_for_timeout(6000)
+    await cerrar_popups(page)
+    print("OK")
+    return True
+
+# ── BOOKMAKER SCRAPE ──────────────────────────────────────────────────────────
+BK_ODDS_JS = """
+() => {
+  const partidos = [];
+  const lines = document.body.innerText.split('\\n')
+    .map(function(l){ return l.trim(); })
+    .filter(function(l){ return l.length > 0; });
+
+  function esOddDecimal(raw) {
+    var r = raw.replace(',', '.');
+    if (r.indexOf('.') === -1) return false;
+    var v = parseFloat(r);
+    return !isNaN(v) && v >= 1.05 && v <= 50;
+  }
+  function esOddAmericana(raw) {
+    return /^[+-][0-9]{2,4}$/.test(raw);
+  }
+  function americanaADecimal(raw) {
+    var a = parseInt(raw);
+    return a > 0 ? parseFloat((a/100+1).toFixed(3)) : parseFloat((100/Math.abs(a)+1).toFixed(3));
+  }
+
+  for (var i = 0; i < lines.length - 2; i++) {
+    var l = lines[i];
+    var esPartido = l.indexOf(' vs ') !== -1 || l.indexOf(' VS ') !== -1 ||
+                    l.indexOf(' @ ')  !== -1 ||
+                    (l.length > 4 && l.length < 80);
+    if (!esPartido) continue;
+
+    var cuotas = [];
+    for (var j = i+1; j < Math.min(i+12, lines.length); j++) {
+      var raw = lines[j].replace(',','.');
+      if (esOddAmericana(lines[j])) {
+        cuotas.push(americanaADecimal(lines[j]));
+      } else if (esOddDecimal(raw)) {
+        cuotas.push(parseFloat(raw));
+      }
+    }
+    if (cuotas.length >= 2) {
+      var unique = cuotas.filter(function(v,idx,arr){ return arr.indexOf(v) === idx; });
+      partidos.push({nombre: l.slice(0,70), cuotas: unique.slice(0,4)});
+      i += 3;
+    }
+  }
+  return partidos;
+}
+"""
+
 async def scrape_bk(page):
     partidos = []
     try:
-        print("  [BK] Leyendo cuotas...", end=" ", flush=True)
+        print("  [BK] Cuotas...", end=" ", flush=True)
         await page.goto("https://www.bookmaker.eu/sports-betting/football",
                         wait_until="networkidle", timeout=40000)
         await page.wait_for_timeout(3000)
-
-        # Bypass si aparece de nuevo
-        try:
-            bypass = page.locator("text=Continuar de todos modos")
-            if await bypass.count() > 0:
-                await bypass.first.click()
-                await page.wait_for_timeout(2000)
-        except: pass
-
+        await cerrar_popups(page)
         html_len = len(await page.content())
-
-        resultado = await page.evaluate("""
-          () => {
-            const partidos = [];
-            const lines = document.body.innerText.split('\\n')
-              .map(l => l.trim()).filter(l => l.length > 0);
-
-            for (let i = 0; i < lines.length - 2; i++) {
-              const l = lines[i];
-              const esPartido = l.includes(' vs ') || l.includes(' VS ') ||
-                                l.includes(' @ ') ||
-                                (l.length > 4 && l.length < 80);
-              if (!esPartido) continue;
-
-              const cuotas = [];
-              for (let j = i+1; j < Math.min(i+12, lines.length); j++) {
-                const raw = lines[j].replace(',','.');
-                // Cuotas americanas (+150, -110)
-                const am = raw.match(/^([+-]\d{2,4})$/);
-                if (am) {
-                  const a = parseInt(am[1]);
-                  const dec = a > 0 ? +(a/100+1).toFixed(3) : +(100/Math.abs(a)+1).toFixed(3);
-                  if (dec >= 1.05 && dec <= 50) { cuotas.push(dec); continue; }
-                }
-                // Cuotas decimales
-                if (/^\d+[.,]\d{1,4}$/.test(raw)) {
-                  const d = parseFloat(raw);
-                  if (d >= 1.05 && d <= 50) cuotas.push(d);
-                }
-              }
-              if (cuotas.length >= 2) {
-                partidos.push({nombre: l.slice(0,70), cuotas: [...new Set(cuotas)].slice(0,4)});
-                i += 3;
-              }
-            }
-            return partidos;
-          }
-        """)
-
-        partidos = resultado
+        partidos = await page.evaluate(BK_ODDS_JS)
         print(f"OK ({len(partidos)} partidos, html: {html_len:,} chars)")
-
-        if len(partidos) == 0:
-            txt = await page.evaluate("() => document.body.innerText")
+        if len(partidos) == 0 and html_len < 80000:
+            txt = await page.evaluate("function(){ return document.body.innerText; }")
             Path("debug_bk_live.txt").write_text(txt[:5000], encoding="utf-8")
-            print(f"  [BK] 0 partidos - ver debug_bk_live.txt")
+            await page.screenshot(path="debug_bk_live.png")
+            print("  [BK] Screenshot guardado: debug_bk_live.png")
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
 
-# ── CRUZAR PARTIDOS Y BUSCAR ARB ─────────────────────────────────
+# ── CRUZAR Y ALERTAR ─────────────────────────────────────────────────────────
 def cruzar(bw, bk):
     surebets = []; matches = 0
     for pbw in bw:
@@ -319,7 +352,7 @@ def cruzar(bw, bk):
                               "odd_bw": o_bw, "odd_bk": o_bk, **res}
                         surebets.append(sb)
                         alerta(sb)
-    if matches: print(f"  {matches} partidos cruzados entre casas")
+    if matches: print(f"  {matches} partidos cruzados")
     return surebets
 
 def alerta(sb):
@@ -337,7 +370,7 @@ def alerta(sb):
     print(f"  GANANCIA  : ${sb['ganancia']:>10,.2f}   ROI: {sb['roi']:.2f}%")
     print("=" * 66)
 
-# ── SCAN PRINCIPAL ───────────────────────────────────────────────
+# ── SCAN ─────────────────────────────────────────────────────────────────────
 async def scan_once(page_bw, page_bk):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{ts}] ---- INICIO DE SCAN ----")
@@ -355,24 +388,22 @@ async def scan_once(page_bw, page_bk):
         print(f"  [RESULTADO] Sin surebets (margen min: {MIN_MARGEN}%)")
     return surebets
 
-# ── MAIN ───────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
     if not BK_USER or not BK_PASS or not BW_USER or not BW_PASS:
-        print("[ERROR] Falta usuario/contrasena en .env")
-        print("Verificar: BETWARRIOR_USER, BETWARRIOR_PASS, BOOKMAKER_USER, BOOKMAKER_PASS")
+        print("[ERROR] Faltan credenciales en .env")
+        print("Necesario: BETWARRIOR_USER, BETWARRIOR_PASS, BOOKMAKER_USER, BOOKMAKER_PASS")
         return
 
     print(f"""
 ================================================================
-  BETBOT SCANNER v4.3 - Betwarrior vs Bookmaker.eu
+  BETBOT SCANNER v4.4 - Betwarrior vs Bookmaker.eu
 ================================================================
-  Bankroll      : ${BANKROLL:,.0f}
-  Margen min    : {MIN_MARGEN:.1f}%
-  Intervalo     : {SCAN_INTERVAL}s
-  BW Usuario    : {BW_USER}
-  BK Usuario    : {BK_USER}
+  Bankroll  : ${BANKROLL:,.0f}  |  Margen min: {MIN_MARGEN:.1f}%  |  Intervalo: {SCAN_INTERVAL}s
+  BW Login  : {BW_USER}
+  BK Login  : {BK_USER}
 ================================================================
-  Iniciando sesiones...
+  Iniciando sesiones (puede tardar 20-30 seg)...
 ================================================================""")
 
     async with async_playwright() as p:
@@ -387,12 +418,16 @@ async def main():
         page_bw = await ctx_bw.new_page()
         page_bk = await ctx_bk.new_page()
 
-        # Login secuencial primero (no en paralelo para evitar problemas)
-        await bw_login(page_bw)
-        await bk_login(page_bk)
+        # Login secuencial
+        ok_bw = await bw_login(page_bw)
+        ok_bk = await bk_login(page_bk)
 
-        print("\n  Sesiones iniciadas. Comenzando scans...")
+        if not ok_bw:
+            print("  [AVISO] BW login fallo - revisa debug_bw_login.png")
+        if not ok_bk:
+            print("  [AVISO] BK login fallo - revisa debug_bk_login.png")
 
+        print("\n  Comenzando scans...")
         total = 0; scan_n = 0
         while True:
             try:
@@ -402,10 +437,10 @@ async def main():
                 print(f"\n  Scans: {scan_n} | Surebets: {total} | Proximo en {SCAN_INTERVAL}s...")
                 await asyncio.sleep(SCAN_INTERVAL)
             except KeyboardInterrupt:
-                print(f"\nDetenido. Total surebets: {total}")
+                print(f"\nDetenido. Total: {total}")
                 break
             except Exception as e:
-                print(f"  Error en scan: {e}")
+                print(f"  Error: {e}")
                 await asyncio.sleep(15)
 
         await browser.close()
