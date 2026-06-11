@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-arb_scanner.py v4.8
-Unico fix: scrape_bw usaba reload(networkidle) que cuelga en Kambi.
-Ahora usa domcontentloaded + espera fija 8s.
+arb_scanner.py v5.0
+Dos browsers VISIBLES simultaneos - igual que Arber:
+  - BW y BK abren en ventanas reales lado a lado
+  - Detecta surebet
+  - Coloca apuestas automaticamente en ambas casas al mismo tiempo
+  - Confirma y muestra ganancia
 """
 import asyncio, json, os, re
 from datetime import datetime
@@ -24,6 +27,7 @@ BW_USER       = os.getenv("BETWARRIOR_USER", "").strip()
 BW_PASS       = os.getenv("BETWARRIOR_PASS", "").strip()
 BK_USER       = os.getenv("BOOKMAKER_USER", "").strip()
 BK_PASS       = os.getenv("BOOKMAKER_PASS", "").strip()
+AUTO_BET      = os.getenv("AUTO_BET", "false").lower() == "true"
 ALERT_LOG     = Path("surebets_encontrados.json")
 SIM_THRESHOLD = 0.52
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -69,23 +73,50 @@ async def bw_login(page):
         return True
     except Exception as e:
         await page.screenshot(path="debug_bw_login.png")
-        print(f"FALLO ({e}) - ver debug_bw_login.png")
+        print(f"FALLO ({e})")
         return False
 
-# ── BETWARRIOR SCRAPE ── FIX: domcontentloaded en vez de networkidle ──────────
+# ── BOOKMAKER LOGIN ────────────────────────────────────────────────────
+async def bk_login(page):
+    print("  [BK] Login...", end=" ", flush=True)
+    try:
+        await page.goto("https://www.bookmaker.eu/",
+                        wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(3000)
+        await page.get_by_role("textbox", name="Account").fill(BK_USER)
+        await page.wait_for_timeout(300)
+        await page.get_by_role("textbox", name="Password").fill(BK_PASS)
+        await page.wait_for_timeout(300)
+        await page.get_by_role("button", name="Login").click()
+        await page.wait_for_timeout(6000)
+        await page.goto("https://be.bookmaker.eu/en/sports/",
+                        wait_until="networkidle", timeout=40000)
+        await page.wait_for_timeout(3000)
+        try:
+            cb = page.get_by_role("checkbox", name="Don't show again")
+            if await cb.count() > 0:
+                await cb.check()
+            ok = page.get_by_text("Ok", exact=True)
+            if await ok.count() > 0:
+                await ok.click()
+            await page.wait_for_timeout(1500)
+        except: pass
+        print("OK")
+        return True
+    except Exception as e:
+        await page.screenshot(path="debug_bk_login.png")
+        print(f"FALLO ({e})")
+        return False
+
+# ── BETWARRIOR SCRAPE ────────────────────────────────────────────────────
 async def scrape_bw(page):
     partidos = []
     try:
         print("  [BW] Cuotas...", end=" ", flush=True)
-
-        # FIX CLAVE: Kambi nunca dispara networkidle -> cuelga para siempre
-        # Usar domcontentloaded + espera fija para que carguen las cuotas JS
         try:
             await page.reload(wait_until="domcontentloaded", timeout=20000)
-        except:
-            pass
-        await page.wait_for_timeout(8000)  # esperar que Kambi cargue cuotas via JS
-
+        except: pass
+        await page.wait_for_timeout(8000)
         partidos = await page.evaluate("""
         (function() {
           var partidos = [];
@@ -128,39 +159,6 @@ async def scrape_bw(page):
         print(f"ERROR: {e}")
     return partidos
 
-# ── BOOKMAKER LOGIN ────────────────────────────────────────────────────
-async def bk_login(page):
-    print("  [BK] Login...", end=" ", flush=True)
-    try:
-        await page.goto("https://www.bookmaker.eu/",
-                        wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
-        await page.get_by_role("textbox", name="Account").fill(BK_USER)
-        await page.wait_for_timeout(300)
-        await page.get_by_role("textbox", name="Password").fill(BK_PASS)
-        await page.wait_for_timeout(300)
-        await page.get_by_role("button", name="Login").click()
-        await page.wait_for_timeout(6000)
-        await page.goto("https://be.bookmaker.eu/en/sports/",
-                        wait_until="networkidle", timeout=40000)
-        await page.wait_for_timeout(3000)
-        try:
-            cb = page.get_by_role("checkbox", name="Don't show again")
-            if await cb.count() > 0:
-                await cb.check()
-            ok = page.get_by_text("Ok", exact=True)
-            if await ok.count() > 0:
-                await ok.click()
-            await page.wait_for_timeout(1500)
-        except: pass
-        html_len = len(await page.content())
-        print(f"OK (html: {html_len:,} chars)")
-        return True
-    except Exception as e:
-        await page.screenshot(path="debug_bk_login.png")
-        print(f"FALLO ({e}) - ver debug_bk_login.png")
-        return False
-
 # ── BOOKMAKER SCRAPE ────────────────────────────────────────────────────
 BK_SPORTS = [
     "https://be.bookmaker.eu/en/sports/",
@@ -177,8 +175,7 @@ async def scrape_bk(page):
             try:
                 await page.goto(url, wait_until="networkidle", timeout=35000)
                 await page.wait_for_timeout(2000)
-            except:
-                continue
+            except: continue
             for txt in ["Don't show again", "Ok", "Accept", "Close"]:
                 try:
                     el = page.get_by_text(txt, exact=True)
@@ -216,24 +213,119 @@ async def scrape_bk(page):
             })()
             """)
             for row in rows:
-                cuotas_dec = [americana_a_decimal(ml) for ml in row["cuotas"]]
-                cuotas_dec = [c for c in cuotas_dec if c]
-                if len(cuotas_dec) >= 2:
-                    partidos.append({"nombre": row["nombre"], "cuotas": cuotas_dec})
-
-        html_len = len(await page.content())
-        print(f"OK ({len(partidos)} partidos, html: {html_len:,} chars)")
+                cd = [americana_a_decimal(ml) for ml in row["cuotas"]]
+                cd = [c for c in cd if c]
+                if len(cd) >= 2:
+                    partidos.append({"nombre": row["nombre"], "cuotas": cd})
+        print(f"OK ({len(partidos)} partidos)")
         if len(partidos) == 0:
             await page.screenshot(path="debug_bk_live.png")
-            txt = await page.evaluate("(function(){ return document.body.innerText; })()")
-            Path("debug_bk_live.txt").write_text(txt[:5000], encoding="utf-8")
-            print("  [BK] 0 partidos - ver debug_bk_live.png")
     except Exception as e:
         print(f"ERROR: {e}")
     return partidos
 
-# ── CRUZAR ───────────────────────────────────────────────────────────────────────
-def cruzar(bw, bk):
+# ── APOSTAR SIMULTANEAMENTE (como Arber) ─────────────────────────────────
+async def apostar_bw(page, sb):
+    """Navega al partido en BW y coloca la apuesta."""
+    try:
+        print(f"  [BW] Colocando apuesta ${sb['s1']:.2f} @ {sb['odd_bw']}...", end=" ", flush=True)
+        # Buscar el outcome con la cuota correcta y hacer click
+        clicked = await page.evaluate(f"""
+        (function() {{
+          var target = {sb['odd_bw']};
+          var outcomes = document.querySelectorAll('[class*="KambiBC-betty-outcome"]');
+          for (var i=0; i<outcomes.length; i++) {{
+            var spans = outcomes[i].querySelectorAll('span,div');
+            for (var j=0; j<spans.length; j++) {{
+              if (parseFloat(spans[j].innerText.trim()) === target) {{
+                outcomes[i].click();
+                return true;
+              }}
+            }}
+          }}
+          return false;
+        }})()
+        """)
+        if not clicked:
+            print("outcome no encontrado")
+            return False
+        await page.wait_for_timeout(1500)
+        # Ingresar monto en el betslip
+        stake_sel = "input[data-testid*='stake'], input[placeholder*='monto'], input[placeholder*='Monto'], input[class*='stake'], input[class*='amount']"
+        try:
+            await page.wait_for_selector(stake_sel, timeout=5000)
+            await page.fill(stake_sel, str(sb['s1']))
+            await page.wait_for_timeout(800)
+            # Confirmar apuesta
+            await page.click("button[data-testid*='place'], button:has-text('Confirmar'), button:has-text('Apostar'), button:has-text('Place Bet')")
+            await page.wait_for_timeout(2000)
+            print("CONFIRMADA")
+            return True
+        except:
+            print("betslip no abierto")
+            return False
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return False
+
+async def apostar_bk(page, sb):
+    """Coloca apuesta en BK sobre el partido ya cargado."""
+    try:
+        print(f"  [BK] Colocando apuesta ${sb['s2']:.2f} @ {sb['odd_bk']}...", end=" ", flush=True)
+        # Buscar moneyline equivalente y click
+        # BK usa tabla - buscar el link del partido
+        enlaces = await page.evaluate("""
+        (function() {
+          var links = document.querySelectorAll('a[href*="/lines/"], a[href*="/sports/"]');
+          var arr = [];
+          links.forEach(function(a) { arr.push({text: a.innerText.trim(), href: a.href}); });
+          return arr;
+        })()
+        """)
+        evento_bk = sb.get('evento_bk', '')
+        target_href = None
+        for l in enlaces:
+            if similitud(l['text'], evento_bk) > 0.4:
+                target_href = l['href']
+                break
+        if target_href:
+            await page.goto(target_href, wait_until="networkidle", timeout=20000)
+            await page.wait_for_timeout(2000)
+        # Click en la cuota correcta
+        target_ml = int((sb['odd_bk'] - 1) * 100) if sb['odd_bk'] >= 2 else -int(100 / (sb['odd_bk'] - 1))
+        clicked = await page.evaluate(f"""
+        (function() {{
+          var cells = document.querySelectorAll('td,a');
+          for (var i=0; i<cells.length; i++) {{
+            var txt = cells[i].innerText.trim();
+            if (txt === '{target_ml:+d}' || txt === '{target_ml}') {{
+              cells[i].click();
+              return true;
+            }}
+          }}
+          return false;
+        }})()
+        """)
+        await page.wait_for_timeout(1500)
+        # Ingresar monto
+        stake_sel = "input[name*='amount'], input[name*='stake'], input[placeholder*='Amount'], input[class*='wager']"
+        try:
+            await page.wait_for_selector(stake_sel, timeout=5000)
+            await page.fill(stake_sel, str(sb['s2']))
+            await page.wait_for_timeout(800)
+            await page.click("input[value*='Place'], button:has-text('Place'), button:has-text('Submit')")
+            await page.wait_for_timeout(2000)
+            print("CONFIRMADA")
+            return True
+        except:
+            print("betslip no abierto")
+            return False
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return False
+
+# ── CRUZAR Y EJECUTAR ───────────────────────────────────────────────────────
+async def cruzar_y_ejecutar(bw, bk, page_bw, page_bk):
     surebets = []; matches = 0
     for pbw in bw:
         for pbk in bk:
@@ -247,68 +339,92 @@ def cruzar(bw, bk):
                               "evento": pbw["nombre"], "evento_bk": pbk["nombre"],
                               "odd_bw": o_bw, "odd_bk": o_bk, **res}
                         surebets.append(sb)
-                        alerta(sb)
+                        imprimir_oportunidad(sb)
+                        if AUTO_BET:
+                            print("  Placing bets simultaneously...")
+                            r1, r2 = await asyncio.gather(
+                                apostar_bw(page_bw, sb),
+                                apostar_bk(page_bk, sb)
+                            )
+                            if r1 and r2:
+                                print(f"  Profit: ${sb['ganancia']:.2f} USD / {sb['roi']:.2f}%")
+                            else:
+                                print("  AVISO: una o ambas apuestas fallaron - verificar manualmente")
     if matches: print(f"  {matches} partidos cruzados entre casas")
     return surebets
 
-def alerta(sb):
+def imprimir_oportunidad(sb):
     print()
     print("=" * 66)
-    print("  *** SUREBET ENCONTRADO - APOSTA AHORA! ***")
+    print("  *** OPPORTUNITY FOUND ***")
     print("=" * 66)
     print(f"  Evento BW  : {sb['evento']}")
     print(f"  Evento BK  : {sb['evento_bk']}")
     print(f"  {'-'*62}")
-    print(f"  APUESTA 1 : ${sb['s1']:>10,.2f}  cuota {sb['odd_bw']:.3f}  --> BETWARRIOR")
-    print(f"  APUESTA 2 : ${sb['s2']:>10,.2f}  cuota {sb['odd_bk']:.3f}  --> BOOKMAKER.EU")
+    print(f"  Placing in BetWarrior : ${sb['s1']:>9,.2f}  @ {sb['odd_bw']:.3f}")
+    print(f"  Placing in Bookmaker  : ${sb['s2']:>9,.2f}  @ {sb['odd_bk']:.3f}")
     print(f"  {'-'*62}")
     print(f"  Margen    : +{sb['margen']:.3f}%")
-    print(f"  GANANCIA  : ${sb['ganancia']:>10,.2f}   ROI: {sb['roi']:.2f}%")
+    print(f"  Profit    : ${sb['ganancia']:>9,.2f}   ROI: {sb['roi']:.2f}%")
     print("=" * 66)
 
 async def scan_once(page_bw, page_bk):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"\n[{ts}] ---- INICIO DE SCAN ----")
+    print(f"\n[{ts}] ---- SCANNING ----")
     bw_r, bk_r = await asyncio.gather(scrape_bw(page_bw), scrape_bk(page_bk))
     print(f"  [BW] {len(bw_r)} partidos | [BK] {len(bk_r)} partidos")
-    surebets = cruzar(bw_r, bk_r)
-    if surebets:
+    surebets = await cruzar_y_ejecutar(bw_r, bk_r, page_bw, page_bk)
+    if not surebets:
+        print(f"  No opportunities (min margin: {MIN_MARGEN}%)")
+    else:
         hist = []
         if ALERT_LOG.exists():
             try: hist = json.loads(ALERT_LOG.read_text(encoding="utf-8"))
             except: pass
         ALERT_LOG.write_text(json.dumps(hist+surebets, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"  [GUARDADO] {len(surebets)} surebet(s) en {ALERT_LOG}")
-    else:
-        print(f"  [RESULTADO] Sin surebets (margen min: {MIN_MARGEN}%)")
     return surebets
 
 async def main():
     if not BK_USER or not BK_PASS or not BW_USER or not BW_PASS:
         print("[ERROR] Faltan credenciales en .env")
         return
+
+    modo = "AUTO-BET ACTIVO" if AUTO_BET else "SOLO DETECCION (AUTO_BET=false en .env)"
     print(f"""
 ================================================================
-  BETBOT SCANNER v4.8 - Betwarrior (Kambi) vs Bookmaker.eu
+  BETBOT SCANNER v5.0 - BetWarrior vs Bookmaker.eu
 ================================================================
   Bankroll  : ${BANKROLL:,.0f}  |  Margen: {MIN_MARGEN:.1f}%  |  Intervalo: {SCAN_INTERVAL}s
+  Modo      : {modo}
   BW Login  : {BW_USER}
   BK Login  : {BK_USER}
+================================================================
+  Para activar apuestas automaticas: agregar AUTO_BET=true en .env
 ================================================================""")
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+        # DOS BROWSERS VISIBLES - lado a lado como Arber
+        browser_bw = await p.chromium.launch(
+            headless=False,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+                  "--window-position=0,0", "--window-size=960,900"]
         )
-        vp = {"width": 1400, "height": 900}
-        ctx_bw = await browser.new_context(user_agent=UA, locale="es-AR", viewport=vp)
-        ctx_bk = await browser.new_context(user_agent=UA, locale="en-US", viewport=vp)
+        browser_bk = await p.chromium.launch(
+            headless=False,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled",
+                  "--window-position=960,0", "--window-size=960,900"]
+        )
+
+        vp = {"width": 960, "height": 900}
+        ctx_bw = await browser_bw.new_context(user_agent=UA, locale="es-AR", viewport=vp)
+        ctx_bk = await browser_bk.new_context(user_agent=UA, locale="en-US", viewport=vp)
         page_bw = await ctx_bw.new_page()
         page_bk = await ctx_bk.new_page()
+
         print("  Iniciando sesiones...")
-        await bw_login(page_bw)
-        await bk_login(page_bk)
-        print("  Sesiones listas. Escaneando...")
+        await asyncio.gather(bw_login(page_bw), bk_login(page_bk))
+        print("  Arber started.")
+
         total = 0; scan_n = 0
         while True:
             try:
@@ -318,12 +434,14 @@ async def main():
                 print(f"\n  Scans: {scan_n} | Surebets: {total} | Proximo en {SCAN_INTERVAL}s...")
                 await asyncio.sleep(SCAN_INTERVAL)
             except KeyboardInterrupt:
-                print(f"\nDetenido. Total: {total}")
+                print(f"\nDetenido. Total encontrados: {total}")
                 break
             except Exception as e:
                 print(f"  Error: {e}")
                 await asyncio.sleep(15)
-        await browser.close()
+
+        await browser_bw.close()
+        await browser_bk.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
